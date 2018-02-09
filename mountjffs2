@@ -1,0 +1,534 @@
+#!/bin/bash
+#
+# Script to mount/unmount a JFFS2 file-system-image on a desktop-
+# linux-system.
+#
+# 2014/04/30	vf		v1.4 - Do not try to write to /temp, use /tmp instead
+#							             (incorrect error-handling)
+#                        - Check if mkfs.jffs2 and sumtool are installed
+#                        - Add -v command to print out version
+#         23  vf		v1.3 Set eraseblock nand-type dependent
+#							 					 Switch to superuser eventually
+#         18	vf		v1.2 Support multiple images in parallel
+#         16	vf		v1.1 syntax closer to the conventional mount/umount
+# 2013/10/11	vf		V1.0
+#
+# Usage: mountjffs2 [ -t NAND_TYPE ] [ -d ] [ -u ] jffs2-image-file mount-point
+#  		   mountjffs2 -u mount-point
+#  		   mountjffs2 -d mount-point
+#        umountjffs2 [ -d ] mount-point
+
+
+##
+## modprobe nandsim cache_file=/tmp/nandsim_cache first_id_byte=0x20 second_id_byte=0xaa
+##					third_id_byte=0x00 fourth_id_byte=0x15 parts=0x200,0x200,0x200
+## The first partition has the size = (0x200 * erasesize). 4 partitons 128MB each
+##
+
+
+# Version
+VERS="v1.4"
+
+# MTD device file
+MTDBLK="/tmp/mtdblock"
+
+# Linux standard error return code
+CMD_NOT_FOUND="127"
+
+# Set "partiton" invalid - must be 0 .. 15
+MTDNUM="255"
+
+# Maximum supported "partition" on a device
+MAXPART="15"
+
+# Unmount flag/command, this one can be used as a prefix, like
+# unmount_xxx (prepare a link for that...)
+UMNT_CMD="umount"
+
+# ######################################################################
+# 0 means mount,
+# 1 means umountjffs2 called
+# 2 is mount -u or mount -d
+# 3 means unmount and discarding changes
+UMNT=0
+
+# error sample flag
+ERR_FLG=0
+
+# mount point
+MP=""
+
+# ######################################################################
+# Suported NAND devices. Please note that only the 1GB image uses
+# a cache-file at the moment
+
+# Sizes from 16MB up to 256MB, using 512 byte pages, 16KB sector size
+NAND_16M_512="first_id_byte=0x20 second_id_byte=0x33"
+NAND_32M_512="first_id_byte=0x20 second_id_byte=0x35"
+NAND_64M_512="first_id_byte=0x20 second_id_byte=0x36"
+NAND_128M_512="first_id_byte=0x20 second_id_byte=0x78"
+NAND_256M_512="first_id_byte=0x20 second_id_byte=0x71"
+
+# Sizes from 64MB up to 1GB, using 2048 byte pages, 128KB sector size
+NAND_64M_2048="first_id_byte=0x20 second_id_byte=0xa2 third_id_byte=0x00 fourth_id_byte=0x15"
+NAND_128M_2048="first_id_byte=0xec second_id_byte=0xa1 third_id_byte=0x00 fourth_id_byte=0x15"
+NAND_256M_2048="first_id_byte=0x20 second_id_byte=0xaa third_id_byte=0x00 fourth_id_byte=0x15"
+NAND_512M_2048="first_id_byte=0x20 second_id_byte=0xac third_id_byte=0x00 fourth_id_byte=0x15"
+NAND_1G_2048="cache_file=/tmp/nandsim.tmp first_id_byte=0xec second_id_byte=0xd3 third_id_byte=0x51 fourth_id_byte=0x95"
+
+# Default type is 512MB, 2048 byte per page, sector-size 128KB (erase-block)
+NAND_TYPE=${NAND_512M_2048}
+NAND_SIZE=0x20000000
+PAGE_SIZE=2048
+ERASE_BLOCK=0x20000
+
+# Number of partitions.
+# Actually you can only have one single NAND simulator active on a single
+# system, so you need to use several partitions if you want to support
+# multiple JFFS2 images in parallel.
+# Please note that we currently only support to split a given NAND simulator
+# into equal-sized partitions - however you can easily change this behaviour
+# by adding another option.
+#
+# Default is to have ONE partition. - Please note that you need to specify
+# the number of partitions at the FIRST call of "mountjffs2", so that for
+# subsequent calls the needed partition is already there.
+NOF_PART=1
+MIN_NOF_PART=1
+MAX_NOF_PART=4
+
+# ######################################################################
+# Endianness, default is system-value (little on a pc)
+# This lets you create an image for a different architecture
+ENDIAN=""
+
+# ######################################################################
+
+help()
+{
+	echo "$@"
+	echo "Usage is:"
+	echo "    $0 -h to show some help"
+	echo "    $0 -v to show version info"
+	echo " "
+
+	if [ "${UMNT}" = "1" ]; then
+		echo "    $0 [-l] [-b] Mount_Point"
+		echo "        to unmount the image applying changes eventually"
+		echo "        -l to generate a little-endian image"
+		echo "        -b for a big-endian"
+		echo "Or"
+		echo "    $0 -d Mount_Point"
+	else
+		echo "    $0 [-t NAND_TYPE] [-p NOF_PART] Name_of_jffs2_File Mount_Point"
+		echo "        where NAND_TYPE means"
+		echo "            NAND_TYPE=NAND_16M_512   : Size  16MB, Page=512Byte"
+		echo "            NAND_TYPE=NAND_32M_512   : Size  16MB, Page=512Byte"
+		echo "            NAND_TYPE=NAND_64M_512   : Size  16MB, Page=512Byte"
+		echo "            NAND_TYPE=NAND_128M_512  : Size 128MB, Page=512Byte"
+		echo "            NAND_TYPE=NAND_256M_512  : Size 256MB, Page=512Byte"
+		echo "            NAND_TYPE=NAND_64M_2048  : Size  64MB, Page=2KB"
+		echo "            NAND_TYPE=NAND_128M_2048 : Size 128MB, Page=2KB"
+		echo "            NAND_TYPE=NAND_256M_2048 : Size 256MB, Page=2KB"
+		echo "            NAND_TYPE=NAND_512M_2048 : Size 512MB, Page=2KB <- Ddfault"
+		echo "            NAND_TYPE=NAND_1G_2048   : Size   1GB, Page=2KB"
+		echo "        where NOF_PART means"
+		echo "            Number of partitions (1...4), 1 is default"
+		echo "            Make sure to supply the number of partitons at the"
+		echo "            FIRST call (no need to repeat it at subsequent ones)"
+		echo "Or"
+		echo "    $0 -u [-l] [-b] Mount_Point"
+		echo "        to unmount the image applying changes eventually"
+		echo "        -l to generate a little-endian image"
+		echo "        -b for a big-endian"
+		echo "Or"
+		echo "    $0 -d Mount_Point"
+		echo "        to unmount the image discarding changes"
+	fi
+	exit 1
+}
+
+# ######################################################################
+
+err_exit()
+{
+	echo "$@"
+	exit 1
+}
+
+# ######################################################################
+
+load_modules()
+{
+	# Now we need to load a couple of kernel modules to make shure that
+	# we can use the nand simulator
+	modprobe mtdblock  >/dev/null 2>&1
+	ERR_FLG=$(($ERR_FLG + $?))
+
+	# Emulate a certain nand...
+	modprobe nandsim "$@" >/dev/null 2>&1
+	ERR_FLG=$(($ERR_FLG + $?))
+
+	# Load the module for the fs support
+	modprobe jffs2  >/dev/null 2>&1
+	ERR_FLG=$(($ERR_FLG + $?))
+	if [ $? != 0 ]; then
+		err_exit "Cannot load nand(sim) module(s)"
+	fi
+
+}
+
+# ######################################################################
+
+unload_modules()
+{
+	modprobe -r jffs2  		>/dev/null 2>&1
+	modprobe -r nandsim  	>/dev/null 2>&1
+	modprobe -r mtdblock  	>/dev/null 2>&1
+}
+
+# ######################################################################
+
+get_blkno()
+{
+	PARTNUM="0"
+
+	while [ "$PARTNUM" -le "$MAXPART" ]; do
+
+		# Check if an is mounted to find a free one
+		mount -l -t jffs2 | grep ${MTDBLK}${PARTNUM} >/dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			MTDNUM=$PARTNUM
+			return 0
+		fi
+
+		PARTNUM=$(($PARTNUM + 1))
+	done
+
+	return 1
+}
+
+# ######################################################################
+# Save the full path of the image file to a temp file so that we can
+# easily identify it when we get an "umount mountpoint" command
+#
+# Parameter is "partno mountpoint imagefile eraseblock_size"
+
+wrt_part_info()
+{
+	echo "$2:$3:$4" >${MTDBLK}.$1
+}
+
+# Paramter is mountpoint
+get_img_file()
+{
+	PARTNUM="0"
+
+	while [ "$PARTNUM" -le "$MAXPART" ]; do
+
+		if [ -f "${MTDBLK}.$PARTNUM" ]; then
+			# read mountpoint from file
+			while IFS=: read TMP1 TMP2 TMP3;
+			do
+				if [ "$TMP1" = "$@" ]; then
+					JFFSIMG=$TMP2
+					MTDNUM=$PARTNUM
+					ERASE_BLOCK=$TMP3
+					return 0
+				fi
+			done < "${MTDBLK}.$PARTNUM"
+
+		fi
+
+		PARTNUM=$(($PARTNUM + 1))
+	done
+
+	return 1
+}
+
+# ######################################################################
+# ######################################################################
+
+# ----------------------------------------------------------------------
+# Eventually switch to "superuser", avoid to force the use to type
+# 	sudo bash ./mountjffs2 ....
+
+USER=`whoami`
+
+if [ "$USER" != "root" ]; then
+	sudo -u root bash $0 $@
+	exit
+fi
+
+# ----------------------------------------------------------------------
+# Look if needed tools are available, no need to check kernel modules
+# here...
+
+mkfs.jffs2 -h >/dev/null 2>&1
+if [ $? -eq "${CMD_NOT_FOUND}" ]; then
+	err_exit "mkfs.jffs2 not installed"
+fi
+
+sumtool -h >/dev/null 2>&1
+if [ $? -eq "${CMD_NOT_FOUND}" ]; then
+	err_exit "sumtool not installed"
+fi
+
+# ----------------------------------------------------------------------
+# First of all, check how we have been called...
+echo "$0" | grep ${UMNT_CMD}_ >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+	UMNT=1
+fi
+
+# ----------------------------------------------------------------------
+# Set default NAND type
+NAND="NAND_512M_2048"
+
+# ----------------------------------------------------------------------
+# Evaluate options. Note that we do check for conflicting options but
+# we do NOT check for senseless ones like NAND_TYPE or ERASEBLOCK for
+# unmout operations
+while getopts ':uvdhlbp:t:' OPTION ; do
+	case "$OPTION" in
+		u) 	if [ $UMNT = 3 ]; then
+				help "conflicting options u/d detected"
+			else
+				UMNT=2
+			fi
+			;;
+		d) 	if [ $UMNT = 2 ]; then
+				help "conflicting options u/d detected"
+			else
+				UMNT=3
+			fi
+			;;
+		t)	NAND=$OPTARG
+			;;
+		p)	NOF_PART=$OPTARG
+			if [ "$NOF_PART" -lt "$MIN_NOF_PART" -o "$NOF_PART" -gt "$MAX_NOF_PART" ]; then
+				help "Maximum number of partitons is $MAX_NOF_PART"
+			fi
+			;;
+		l)	ENDIAN="--little-endian"
+			;;
+		b)	ENDIAN="--big-endian"
+			;;
+		h)	help "$0 $VERS - mount/unmount a JFFS2 image"
+			;;
+		v)  echo "$VERS"
+			exit 0
+			;;
+		*)	help "Unknown Parameter"
+			;;
+	esac
+done
+
+# ----------------------------------------------------------------------
+# Check NAND type
+case $NAND in
+"NAND_16M_512"  )	NAND_TYPE=${NAND_16M_512}
+					NAND_SIZE=0x1000000
+					PAGE_SIZE=512
+					ERASE_BLOCK=0x4000
+					;;
+"NAND_32M_512"  )	NAND_TYPE=${NAND_32M_512}
+					NAND_SIZE=0x2000000
+					PAGE_SIZE=512
+					ERASE_BLOCK=0x4000
+					;;
+"NAND_64M_512"  )	NAND_TYPE=${NAND_64M_512}
+					NAND_SIZE=0x4000000
+					PAGE_SIZE=512
+					ERASE_BLOCK=0x4000
+					;;
+"NAND_128M_512" )	NAND_TYPE=${NAND_128M_512}
+					NAND_SIZE=0x8000000
+					PAGE_SIZE=512
+					ERASE_BLOCK=0x4000
+					;;
+"NAND_256M_512" )	NAND_TYPE=${NAND_256M_512}
+					NAND_SIZE=0x10000000
+					PAGE_SIZE=512
+					;;
+"NAND_64M_2048" )	NAND_TYPE=${NAND_64M_2048}
+					NAND_SIZE=0x4000000
+					PAGE_SIZE=2048
+					ERASE_BLOCK=0x20000
+					;;
+"NAND_128M_2048")	NAND_TYPE=${NAND_128M_2048}
+					NAND_SIZE=0x8000000
+					PAGE_SIZE=2048
+					ERASE_BLOCK=0x20000
+					;;
+"NAND_256M_2048")	NAND_TYPE=${NAND_256M_2048}
+					NAND_SIZE=0x10000000
+					PAGE_SIZE=2048
+					ERASE_BLOCK=0x20000
+					;;
+"NAND_512M_2048")	NAND_TYPE=${NAND_512M_2048}
+					NAND_SIZE=0x20000000
+					PAGE_SIZE=2048
+					ERASE_BLOCK=0x20000
+					;;
+"NAND_1G_2048"  )	NAND_TYPE=${NAND_1G_2048}
+					NAND_SIZE=0x40000000
+					PAGE_SIZE=2048
+					ERASE_BLOCK=0x20000
+					;;
+			   *) 	help "Invalid NAND type specified"
+					;;
+esac
+# ----------------------------------------------------------------------
+# Check number of partitions
+
+if [ $NOF_PART -gt 1 ]; then
+	PART_PAGES=$(( $NAND_SIZE / $ERASE_BLOCK / $NOF_PART))
+
+	NAND_TYPE="${NAND_TYPE} parts=${PART_PAGES}"
+
+	NOF_PART=$(($NOF_PART - 1))
+
+	while [ $NOF_PART -gt 1 ]; do
+		NAND_TYPE="${NAND_TYPE},${PART_PAGES}"
+	done
+
+fi
+
+# ----------------------------------------------------------------------
+# Load parameter into an array for easier access
+
+
+ARGV=( "$@" )
+
+# In case of a mount command, we have the image plus a mountpoint
+
+if [ ${UMNT} = 0 ]; then
+	JFFSIMG=${ARGV[${OPTIND}-1]}
+	MP=${ARGV[${OPTIND}]}
+
+	if [ "${JFFSIMG}" = "" -o "$MP" = ""  ]; then
+		help "Invalid commandline"
+	fi
+
+else
+	JFFSIMG=""
+	MP=${ARGV[${OPTIND}-1]}
+	if [ "$MP" = "" ]; then
+		help "Invalid commandline"
+	fi
+
+fi
+
+# ----------------------------------------------------------------------
+# See what we should do, mounting or unmounting
+
+if [ ${UMNT} = 0 ]; then
+	# Look for a free partition
+
+	get_blkno
+
+	if [ $? != 0 ]; then
+		err_exit "Error no partition available on ${MTDBLK}"
+	fi
+
+	# Mount an image, so we need to check if the device-node is already
+	# there
+	if [ ! -b "${MTDBLK}${MTDNUM}" ] ; then
+		mknod ${MTDBLK}${MTDNUM} b 31 ${MTDNUM} || err_exit "Cannot create device node '${MTDBLK}${MTDNUM} b 31 ${MTDNUM}'"
+	fi
+
+	# Check mount point
+	if [ ! -d "${MP}" ]; then
+		err_exit "Mountpoint ${MP} does not exist"
+	fi
+
+	# Load a couple of kernel modules to support a NAND simulator
+	load_modules ${NAND_TYPE}
+
+	# Copy image to nand
+	echo "Dumping jffs2 to nand(sim)"
+	dd status=noxfer  if="${JFFSIMG}" of="${MTDBLK}${MTDNUM}" >/dev/null 2>&1
+	if [ $? != 0 ]; then
+		err_exit "Error dumping jffs2 image to nand(sim)"
+	fi
+
+	echo "Mounting jffs2 to ${MP}"
+	mount -t jffs2 ${MTDBLK}${MTDNUM} ${MP} >/dev/null 2>&1
+	if [ $? != 0 ]; then
+		err_exit "Error mounting jffs2 to ${MP}"
+	fi
+
+	# write mount info to file
+	wrt_part_info ${MTDNUM} ${MP} ${JFFSIMG} ${ERASE_BLOCK}
+	if [ $? != 0 ]; then
+		err_exit "Error could not save mount info"
+		umount ${MP}
+		unload_modules
+	fi
+
+else
+	# ------------------------------------------------------------------
+	# generate a new jffs2 image from the mounted file-system
+
+	# Check if the image is mounted, so we do not overwrite an existing
+	# image with an empty one
+	mount -l -t jffs2 | grep ${MP} >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		err_exit "No JFFS2 mounted at at $MP"
+	fi
+
+	# Check if we should save or discard changes that have been done
+	# eventually
+	if [ $UMNT = 3 ]; then
+		echo "Discarding changes"
+	else
+		# Get the name of the original imagefile
+		get_img_file ${MP}
+		if [ $? != 0 ]; then
+			echo "Can not determine name of original image file for ${MP}"
+			JFFSIMG="/tmp/tempJFFS2.jffs2"
+			echo "Using $JFFSIMG instead"
+		fi
+
+		# Write the jffs2 image - CAUTION, do NOT use the '--verbose' flag
+		# since - at least on an ubuntu 12.04 system - the tool will crash
+		#
+		# Use temporary names so that in case of any errors, the original
+		# image will be left untouched...
+		echo "Writing jffs2 image"
+		mkfs.jffs2 $ENDIAN --eraseblock=$ERASE_BLOCK -n --pad -d "${MP}" -o "${JFFSIMG}_1"  >/dev/null 2>&1
+
+		# If everything went smoothly, go and optimize the image so that
+		# it will mount faster - this is especially helpful if the image
+		# will be used on a REAL flash device
+		if [ $? = 0 ]; then
+			echo "Writing jffs2 sumtool image"
+			sumtool -n -e $ERASE_BLOCK --pad -i "${JFFSIMG}_1" -o "${JFFSIMG}_2"  >/dev/null 2>&1
+			if [ $? = 0 ]; then
+				echo "Deleting non-sumtool jffs2 image"
+				rm "${JFFSIMG}_1"  				>/dev/null 2>&1
+				rm "${JFFSIMG}"  				>/dev/null 2>&1
+				mv "${JFFSIMG}_2" "${JFFSIMG}"  >/dev/null 2>&1
+			else
+				echo "Could't create sumtool image, using written one"
+				rm "${JFFSIMG}_2"  				>/dev/null 2>&1
+				rm "${JFFSIMG}"  				>/dev/null 2>&1
+				mv "${JFFSIMG}_1" "${JFFSIMG}"  >/dev/null 2>&1
+			fi
+		else
+			echo "Couldn't write jffs2 image '${JFFSIMG}_1', changes will be lost"
+		fi
+	fi
+
+	echo "Unmounting $MP"
+	umount ${MP}  >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		err_exit "Cannot unmount JFFS2 at $MP"
+	fi
+	# remove info file
+	rm -f ${MTDBLK}.${MTDNUM} >/dev/null 2>&1
+
+	# Remove unneeded modules
+	unload_modules
+fi
